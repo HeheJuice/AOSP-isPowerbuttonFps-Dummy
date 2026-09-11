@@ -1,5 +1,7 @@
 package com.HeheJuice.isPowerbuttonFpsDummy;
 
+import android.hardware.fingerprint.FingerprintManager;
+
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collections;
@@ -13,11 +15,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 public class XposedHook implements IXposedHookLoadPackage {
 
-    private static final String TAG = "FPSDummyFix-V7";
+    private static final String TAG = "FPSDummyFix-V8";
     private static final String SYSTEMUI_PACKAGE = "com.android.systemui";
-    private static final String FINGERPRINT_CLASS =
-            "android.hardware.fingerprint.FingerprintManager";
-    private static final String CENTRAL_SURFACES_CLASS =
+    private static final String FM_CLASS = "android.hardware.fingerprint.FingerprintManager";
+    private static final String CS_CLASS =
             "com.android.systemui.statusbar.phone.CentralSurfacesImpl";
 
     private static Object sDummy;
@@ -27,67 +28,64 @@ public class XposedHook implements IXposedHookLoadPackage {
         if (!SYSTEMUI_PACKAGE.equals(lpparam.packageName)) return;
         XposedBridge.log(TAG + ": START");
 
-        // ---- 1. Neutralise FingerprintManager methods --------------------------
-        // These make ANY FingerprintManager reference (real or dummy) safe to call.
+        // ---- 1. Neutralise all FingerprintManager entry points ---------------
         try {
-            Class<?> fm = XposedHelpers.findClass(FINGERPRINT_CLASS, lpparam.classLoader);
-
-            hookAny(fm, "getSensorPropertiesInternal",
-                    XC_MethodReplacement.returnConstant(Collections.emptyList()));
-            hookAny(fm, "getSensorPropertiesInternal", String.class,
-                    XC_MethodReplacement.returnConstant(Collections.emptyList()));
-            hookAny(fm, "getFirstFingerprintSensor",
-                    XC_MethodReplacement.returnConstant(null));
-            hookAny(fm, "isPowerbuttonFps",
-                    XC_MethodReplacement.returnConstant(false));
-
+            Class<?> fm = XposedHelpers.findClass(FM_CLASS, lpparam.classLoader);
+            hook(fm, "getSensorPropertiesInternal",
+                 XC_MethodReplacement.returnConstant(Collections.emptyList()));
+            hook(fm, "getSensorPropertiesInternal", String.class,
+                 XC_MethodReplacement.returnConstant(Collections.emptyList()));
+            hook(fm, "getFirstFingerprintSensor",
+                 XC_MethodReplacement.returnConstant(null));
+            hook(fm, "isPowerbuttonFps",
+                 XC_MethodReplacement.returnConstant(false));
+            hook(fm, "isHardwareDetected",
+                 XC_MethodReplacement.returnConstant(false));
+            hook(fm, "hasEnrolledFingerprints",
+                 XC_MethodReplacement.returnConstant(false));
             XposedBridge.log(TAG + ": FM hooks installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": FM hook failed: " + t);
         }
 
-        // ---- 2. Allocate a bare dummy instance --------------------------------
-        sDummy = unsafeAllocate(FINGERPRINT_CLASS, lpparam.classLoader);
+        // ---- 2. Allocate a bare dummy ----------------------------------------
+        sDummy = unsafeAllocate(FM_CLASS, lpparam.classLoader);
         XposedBridge.log(TAG + ": dummy=" + sDummy);
         if (sDummy == null) return;
 
-        // ---- 3. Make sure mFingerprintManager is never null -------------------
+        // ---- 3. Hook CentralSurfacesImpl --------------------------------------
         try {
-            Class<?> cs = XposedHelpers.findClass(CENTRAL_SURFACES_CLASS, lpparam.classLoader);
+            Class<?> cs = XposedHelpers.findClass(CS_CLASS, lpparam.classLoader);
 
-            // 3a. Outer class ctor, in case the field is field-injected synchronously.
+            // 3a. After construction, ensure field is not null.
             XposedBridge.hookAllConstructors(cs, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
-                    forceNonNull(p.thisObject, "CS-ctor");
+                    patchCs(p.thisObject, "ctor");
                 }
             });
 
-            // 3b. Every inner observer of CentralSurfacesImpl that reacts to wake.
-            //     This covers CentralSurfacesImpl$11 and any equivalent in other builds.
-            int observerCount = 0;
-            for (Class<?> inner : cs.getDeclaredClasses()) {
-                if (findField(inner, "this$0") == null) continue;
-                boolean hasWake = false;
-                for (Method m : inner.getDeclaredMethods()) {
-                    if (m.getName().equals("onStartedWakingUp")) { hasWake = true; break; }
-                }
-                if (!hasWake) continue;
-
-                XposedBridge.hookAllConstructors(inner, new XC_MethodHook() {
-                    @Override protected void afterHookedMethod(MethodHookParam p) {
-                        forceNonNull(getField(p.thisObject, "this$0"), "inner-ctor");
-                    }
-                });
-                XposedBridge.hookAllMethods(inner, "onStartedWakingUp", new XC_MethodHook() {
+            // 3b. onStartedWakingUp can take an int (WakeReason) on A14.
+            //     Hook every overload.
+            for (Method m : cs.getDeclaredMethods()) {
+                if (!m.getName().equals("onStartedWakingUp")) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        forceNonNull(getField(p.thisObject, "this$0"), "inner-wake");
+                        patchCs(p.thisObject, "wake");
                     }
                 });
-                observerCount++;
-                XposedBridge.log(TAG + ": hooked inner " + inner.getName());
             }
 
-            XposedBridge.log(TAG + ": CS hooks installed, observers=" + observerCount);
+            // 3c. Also hook start() — Dagger field injection may happen here.
+            for (Method m : cs.getDeclaredMethods()) {
+                if (!m.getName().equals("start")) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        patchCs(p.thisObject, "start");
+                    }
+                });
+            }
+
+            XposedBridge.log(TAG + ": CS hooks installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": CS hook failed: " + t);
         }
@@ -95,51 +93,36 @@ public class XposedHook implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + ": READY");
     }
 
-    // ---- helpers -------------------------------------------------------------
-
-    private static void forceNonNull(Object target, String from) {
+    /** Find any FingerprintManager-typed field on target and set it to the dummy. */
+    private static void patchCs(Object target, String from) {
         if (target == null) return;
-        Field f = findField(target.getClass(), "mFingerprintManager");
-        if (f == null) {
-            XposedBridge.log(TAG + "[" + from + "]: field not found on " + target.getClass());
-            return;
-        }
-        try {
-            f.setAccessible(true);
-            Object cur = f.get(target);
-            if (cur == null) {
-                f.set(target, sDummy);
-                XposedBridge.log(TAG + "[" + from + "]: set dummy");
+        Class<?> c = target.getClass();
+        while (c != null && c != Object.class) {
+            for (Field f : c.getDeclaredFields()) {
+                if (!f.getType().getName().equals(FM_CLASS)) continue;
+                try {
+                    f.setAccessible(true);
+                    Object cur = f.get(target);
+                    if (cur == null) {
+                        f.set(target, sDummy);
+                        XposedBridge.log(TAG + "[" + from + "]: set " + f.getName());
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + "[" + from + "]: " + f.getName() + " -> " + t);
+                }
             }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "[" + from + "]: " + t);
+            c = c.getSuperclass();
         }
     }
 
-    private static void hookAny(Class<?> c, String name, Object replacement) {
+    private static void hook(Class<?> c, String name, Object replacement) {
         try { XposedHelpers.findAndHookMethod(c, name, (XC_MethodHook) replacement); }
         catch (Throwable ignored) {}
     }
 
-    private static void hookAny(Class<?> c, String name, Class<?> arg, Object replacement) {
+    private static void hook(Class<?> c, String name, Class<?> arg, Object replacement) {
         try { XposedHelpers.findAndHookMethod(c, name, arg, (XC_MethodHook) replacement); }
         catch (Throwable ignored) {}
-    }
-
-    private static Field findField(Class<?> c, String name) {
-        while (c != null && c != Object.class) {
-            try { return c.getDeclaredField(name); }
-            catch (NoSuchFieldException e) { c = c.getSuperclass(); }
-        }
-        return null;
-    }
-
-    private static Object getField(Object obj, String name) {
-        if (obj == null) return null;
-        Field f = findField(obj.getClass(), name);
-        if (f == null) return null;
-        try { f.setAccessible(true); return f.get(obj); }
-        catch (Throwable t) { return null; }
     }
 
     private static Object unsafeAllocate(String className, ClassLoader cl) {
