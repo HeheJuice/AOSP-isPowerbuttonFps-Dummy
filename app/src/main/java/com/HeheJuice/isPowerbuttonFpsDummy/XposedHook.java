@@ -4,6 +4,7 @@ import android.hardware.fingerprint.FingerprintManager;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -13,7 +14,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 public class XposedHook implements IXposedHookLoadPackage {
 
-    private static final String TAG = "FPSDummyFix-V4";
+    private static final String TAG = "FPSDummyFix-V5";
     private static final String SYSTEMUI_PACKAGE = "com.android.systemui";
     private static final String CENTRAL_SURFACES_CLASS =
             "com.android.systemui.statusbar.phone.CentralSurfacesImpl";
@@ -23,90 +24,119 @@ public class XposedHook implements IXposedHookLoadPackage {
             "android.hardware.fingerprint.FingerprintManager";
 
     private static Object sDummy;
+    private static Object sProviderProxy;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
         if (!SYSTEMUI_PACKAGE.equals(lpparam.packageName)) return;
-        XposedBridge.log(TAG + ": ===== V4 START =====");
+        XposedBridge.log(TAG + ": START");
 
-        // 1. Allocate a real FingerprintManager instance without calling its ctor
+        // 1. Bare FingerprintManager instance via Unsafe (no constructor)
         sDummy = unsafeAllocate(FINGERPRINT_CLASS, lpparam.classLoader);
-        XposedBridge.log(TAG + ": dummy = " + sDummy);
+        XposedBridge.log(TAG + ": dummy=" + sDummy);
+        if (sDummy == null) return;
 
-        if (sDummy == null) {
-            XposedBridge.log(TAG + ": FATAL - Unsafe allocation failed, cannot patch.");
+        // 2. Provider proxy whose get() returns the dummy
+        try {
+            Class<?> providerInterface = Class.forName(
+                    "javax.inject.Provider", false, lpparam.classLoader);
+            sProviderProxy = Proxy.newProxyInstance(
+                    lpparam.classLoader,
+                    new Class<?>[]{providerInterface},
+                    (proxy, method, args) -> {
+                        String n = method.getName();
+                        if ("get".equals(n)) return sDummy;
+                        if ("toString".equals(n)) return "FPSProviderDummy";
+                        if ("hashCode".equals(n)) return System.identityHashCode(proxy);
+                        if ("equals".equals(n)) return proxy == args[0];
+                        return null;
+                    });
+            XposedBridge.log(TAG + ": providerProxy=" + sProviderProxy);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": provider proxy failed: " + t);
             return;
         }
 
-        // 2. Hook CentralSurfacesImpl ctor -> set field immediately
+        // 3. Hook CentralSurfacesImpl ctor + onStartedWakingUp
         try {
             Class<?> cs = XposedHelpers.findClass(CENTRAL_SURFACES_CLASS, lpparam.classLoader);
             XposedBridge.hookAllConstructors(cs, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    setField(param.thisObject, "ctor");
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    patch(p.thisObject, "ctor");
                 }
             });
-            XposedBridge.log(TAG + ": ctor hooked");
-
-            // 3. Hook onStartedWakingUp directly
             XposedBridge.hookAllMethods(cs, "onStartedWakingUp", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    setField(param.thisObject, "onStartedWakingUp");
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    patch(p.thisObject, "onStartedWakingUp");
                 }
             });
-            XposedBridge.log(TAG + ": onStartedWakingUp hooked");
+            XposedBridge.log(TAG + ": CS hooks installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": CS hook failed: " + t);
         }
 
-        // 4. Hook the observer class ($11) constructor too
+        // 4. Hook observer ($11) — this is the exact class in the stack trace
         try {
             Class<?> ob = XposedHelpers.findClass(OBSERVER_CLASS, lpparam.classLoader);
             XposedBridge.hookAllConstructors(ob, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    Object outer = getField(param.thisObject, "this$0");
-                    setField(outer, "observer-ctor");
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    patch(getField(p.thisObject, "this$0"), "observer-ctor");
                 }
             });
-            XposedBridge.log(TAG + ": observer ctor hooked");
+            XposedBridge.hookAllMethods(ob, "onStartedWakingUp", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    patch(getField(p.thisObject, "this$0"), "observer-onStartedWakingUp");
+                }
+            });
+            XposedBridge.log(TAG + ": observer hooks installed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": observer hook failed: " + t);
         }
 
-        XposedBridge.log(TAG + ": ===== V4 READY =====");
+        XposedBridge.log(TAG + ": READY");
     }
 
-    private static void setField(Object target, String from) {
+    private static void patch(Object target, String from) {
         if (target == null) return;
         try {
             Field f = findField(target.getClass(), "mFingerprintManager");
             if (f == null) {
-                XposedBridge.log(TAG + "[" + from + "]: field not found on "
-                        + target.getClass().getSimpleName());
+                XposedBridge.log(TAG + "[" + from + "]: field not found");
                 return;
             }
             f.setAccessible(true);
-            Object prev = f.get(target);
-            if (prev == null) {
-                f.set(target, sDummy);
-                XposedBridge.log(TAG + "[" + from + "]: PATCHED mFingerprintManager "
-                        + "on " + target.getClass().getSimpleName());
+            Object cur = f.get(target);
+            Class<?> ft = f.getType();
+
+            if (ft.isInstance(sProviderProxy)) {
+                if (cur == null || !isDummyProvider(cur)) {
+                    f.set(target, sProviderProxy);
+                    XposedBridge.log(TAG + "[" + from + "]: set Provider proxy");
+                }
+            } else if (ft.isInstance(sDummy)) {
+                if (cur == null) {
+                    f.set(target, sDummy);
+                    XposedBridge.log(TAG + "[" + from + "]: set direct dummy");
+                }
             } else {
-                XposedBridge.log(TAG + "[" + from + "]: already set ("
-                        + prev.getClass().getSimpleName() + ")");
+                XposedBridge.log(TAG + "[" + from + "]: unknown field type " + ft.getName());
             }
         } catch (Throwable t) {
             XposedBridge.log(TAG + "[" + from + "]: " + t);
         }
     }
 
+    private static boolean isDummyProvider(Object provider) {
+        try {
+            Method g = provider.getClass().getMethod("get");
+            return g.invoke(provider) == sDummy;
+        } catch (Throwable t) { return false; }
+    }
+
     private static Field findField(Class<?> c, String name) {
         while (c != null && c != Object.class) {
             try { return c.getDeclaredField(name); }
-            catch (NoSuchFieldException ignored) { c = c.getSuperclass(); }
+            catch (NoSuchFieldException e) { c = c.getSuperclass(); }
         }
         return null;
     }
