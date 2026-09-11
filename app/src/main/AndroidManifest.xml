@@ -11,7 +11,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Fixes SystemUI NPE when no fingerprint sensor is present (AOD wake crash)" />
+            android:value="@string/app_desc" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />

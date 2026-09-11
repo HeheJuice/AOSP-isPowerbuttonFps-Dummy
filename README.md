@@ -1,4 +1,4 @@
-# FPSDummyFix
+# AOSP-isPowerbuttonFps-Dummy
 
 修復 Android 14 裝置上 SystemUI 的崩潰問題：這些裝置**沒有指紋感應器**，但系統仍然要求 
 

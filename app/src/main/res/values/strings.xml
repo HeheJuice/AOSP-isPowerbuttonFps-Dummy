@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">isPowerbuttonFps Dummy</string>
+    <string name="app_name">AOSP isPowerbuttonFps Dummy</string>
+    <string name="app_desc">Fixes the SystemUI crash on Android 14 devices with no fingerprint sensor by neutralising FingerprintManager and swallowing the null-pointer exception on wake</string>
 </resources>

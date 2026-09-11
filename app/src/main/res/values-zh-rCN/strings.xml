@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_desc">修复 Android 14 没有指纹传感器设备上的 SystemUI FingerprintManager 崩溃</string>
+</resources>

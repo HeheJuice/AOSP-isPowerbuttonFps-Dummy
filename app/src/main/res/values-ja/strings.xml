@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_desc">指紋センサーを搭載していない Android 14 デバイスでの SystemUI FingerprintManager のクラッシュを修正</string>
+</resources>
