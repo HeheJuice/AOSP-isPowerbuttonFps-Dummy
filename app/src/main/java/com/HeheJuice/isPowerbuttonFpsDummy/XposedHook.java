@@ -15,33 +15,48 @@ public class XposedHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "FPSDummyFix";
     private static final String SYSTEMUI_PACKAGE = "com.android.systemui";
-
     private static final String CENTRAL_SURFACES_CLASS =
             "com.android.systemui.statusbar.phone.CentralSurfacesImpl";
-    private static final String OBSERVER_CLASS =
-            "com.android.systemui.statusbar.phone.CentralSurfacesImpl$11";
     private static final String LAMBDA_CLASS =
             "com.android.systemui.statusbar.phone.CentralSurfacesImpl$11$$ExternalSyntheticLambda0";
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
         if (!SYSTEMUI_PACKAGE.equals(lpparam.packageName)) return;
-        XposedBridge.log(TAG + ": SystemUI loaded, installing diagnostic fix...");
+        XposedBridge.log(TAG + ": SystemUI loaded, installing fix...");
 
         try {
-            Class<?> lambda = XposedHelpers.findClass(LAMBDA_CLASS, lpparam.classLoader);
+            Class<?> lambdaClass = XposedHelpers.findClass(LAMBDA_CLASS, lpparam.classLoader);
 
-            XposedBridge.hookAllMethods(lambda, "run", new XC_MethodHook() {
+            XposedBridge.hookAllMethods(lambdaClass, "run", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    Object self = param.thisObject;
+                    // Walk: lambda -> f$0 (observer) -> this$0 (CentralSurfacesImpl)
+                    // and force mFingerprintManager on CentralSurfacesImpl to be a dummy.
+                    Object lambda = param.thisObject;
+                    Object observer = getField(lambda, "f$0");
+                    if (observer == null) {
+                        // Fallback for non-R8 builds
+                        observer = getField(lambda, "arg$1");
+                    }
+                    if (observer == null) {
+                        XposedBridge.log(TAG + ": Could not find observer field on lambda.");
+                        return;
+                    }
 
-                    // 1. Enumerate the lambda's captured fields
-                    dumpFields("lambda", self, true);
+                    Object centralSurfaces = getField(observer, "this$0");
+                    if (centralSurfaces == null) {
+                        XposedBridge.log(TAG + ": Could not find this$0 on observer.");
+                        return;
+                    }
 
-                    // 2. Patch every FingerprintManager field we can find,
-                    //    walking the lambda's captures and their outers recursively.
-                    deepPatch(self, 0);
+                    boolean patched = forcePatchFingerprintManager(
+                            centralSurfaces, "CentralSurfacesImpl");
+                    if (!patched) {
+                        // As a last resort, walk all fields of the observer's outer
+                        // class recursively looking for a FingerprintManager field.
+                        walkAndPatch(centralSurfaces, 0);
+                    }
                 }
             });
 
@@ -50,62 +65,51 @@ public class XposedHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + ": Lambda hook failed: " + t);
         }
 
-        // Also try the observer class in case it has its own FPS field
-        try {
-            Class<?> observer = XposedHelpers.findClass(OBSERVER_CLASS, lpparam.classLoader);
-            XposedBridge.hookAllConstructors(observer, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    dumpFields("observer-ctor", param.thisObject, true);
-                    deepPatch(param.thisObject, 0);
-                }
-            });
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Observer ctor hook failed: " + t);
-        }
-
         XposedBridge.log(TAG + ": Done.");
     }
 
-    /**
-     * Recursively walk captures / outer references up to depth 3, patching
-     * any null FingerprintManager-typed field and dumping all fields seen.
-     */
-    private static void deepPatch(Object obj, int depth) {
-        if (obj == null || depth > 3) return;
-        Class<?> c = obj.getClass();
+    private static boolean forcePatchFingerprintManager(Object target, String origin) {
+        Class<?> c = target.getClass();
+        while (c != null && c != Object.class) {
+            try {
+                Field f = c.getDeclaredField("mFingerprintManager");
+                f.setAccessible(true);
+                Object current = f.get(target);
+                Object dummy = createDummy(target.getClass().getClassLoader());
+                f.set(target, dummy);
+                XposedBridge.log(TAG + ": [" + origin + "] Force-set mFingerprintManager (was "
+                        + (current == null ? "null" : current.getClass().getSimpleName()) + ")");
+                return true;
+            } catch (NoSuchFieldException ignored) {
+                c = c.getSuperclass();
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": [" + origin + "] Force-set failed: " + t);
+                return false;
+            }
+        }
+        return false;
+    }
 
-        // Only walk our own packages
-        String pkg = c.getName();
-        if (!pkg.startsWith("com.android.systemui")
-                && !pkg.startsWith("com.android.internal")) {
+    private static void walkAndPatch(Object obj, int depth) {
+        if (obj == null || depth > 4) return;
+        Class<?> c = obj.getClass();
+        if (!c.getName().startsWith("com.android.systemui")
+                && !c.getName().startsWith("com.android.internal")) {
             return;
         }
-
         while (c != null && c != Object.class) {
             for (Field f : c.getDeclaredFields()) {
                 try {
                     f.setAccessible(true);
                     Object val = f.get(obj);
-
-                    // Dump every field so we can see what the lambda holds
-                    XposedBridge.log(TAG + ": " + indent(depth) + c.getSimpleName()
-                            + "." + f.getName() + " : " + f.getType().getSimpleName()
-                            + " = " + (val == null ? "null" : val.getClass().getSimpleName()));
-
-                    // Patch null FingerprintManager
-                    if (FingerprintManager.class.isAssignableFrom(f.getType()) && val == null) {
-                        f.set(obj, createDummy());
-                        XposedBridge.log(TAG + ": " + indent(depth) + ">> PATCHED "
-                                + f.getName());
-                    }
-
-                    // Recurse into captured objects of interest
-                    if (val != null && (f.getName().startsWith("arg$")
-                            || f.getName().equals("this$0")
-                            || f.getName().contains("fingerprint")
-                            || f.getName().contains("Fingerprint"))) {
-                        deepPatch(val, depth + 1);
+                    if (FingerprintManager.class.isAssignableFrom(f.getType())) {
+                        if (val == null) {
+                            f.set(obj, createDummy(c.getClassLoader()));
+                            XposedBridge.log(TAG + ": [walk d" + depth + "] Patched "
+                                    + c.getSimpleName() + "." + f.getName());
+                        }
+                    } else if (val != null && isInteresting(f.getName())) {
+                        walkAndPatch(val, depth + 1);
                     }
                 } catch (Throwable ignored) {}
             }
@@ -113,33 +117,31 @@ public class XposedHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static String indent(int n) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < n; i++) sb.append("  ");
-        return sb.toString();
+    private static boolean isInteresting(String name) {
+        return name.startsWith("arg$") || name.startsWith("f$")
+                || name.equals("this$0");
     }
 
-    private static void dumpFields(String tag, Object obj, boolean recurse) {
-        if (obj == null) return;
-        XposedBridge.log(TAG + ": --- dump [" + tag + "] " + obj.getClass().getName());
+    private static Object getField(Object obj, String name) {
+        if (obj == null) return null;
         Class<?> c = obj.getClass();
         while (c != null && c != Object.class) {
-            for (Field f : c.getDeclaredFields()) {
-                try {
-                    f.setAccessible(true);
-                    Object val = f.get(obj);
-                    XposedBridge.log(TAG + ":     " + c.getSimpleName() + "."
-                            + f.getName() + " : " + f.getType().getSimpleName()
-                            + " = " + (val == null ? "null" : "instance"));
-                } catch (Throwable ignored) {}
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(obj);
+            } catch (NoSuchFieldException ignored) {
+                c = c.getSuperclass();
+            } catch (Throwable ignored) {
+                return null;
             }
-            c = c.getSuperclass();
         }
+        return null;
     }
 
-    private static Object createDummy() {
+    private static Object createDummy(ClassLoader cl) {
         return Proxy.newProxyInstance(
-                XposedHook.class.getClassLoader(),
+                cl,
                 new Class<?>[]{ FingerprintManager.class },
                 (proxy, method, args) -> {
                     String name = method.getName();
