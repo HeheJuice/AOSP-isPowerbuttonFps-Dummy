@@ -7,7 +7,6 @@ import java.lang.reflect.Proxy;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
@@ -17,88 +16,134 @@ public class XposedHook implements IXposedHookLoadPackage {
     private static final String TAG = "FPSDummyFix";
     private static final String SYSTEMUI_PACKAGE = "com.android.systemui";
 
-    // The exact lambda that crashes (from the stack trace)
-    private static final String CRASH_LAMBDA =
-            "com.android.systemui.statusbar.phone.CentralSurfacesImpl$11$$ExternalSyntheticLambda0";
-
-    // Fallback: the outer class field name(s) to patch
     private static final String CENTRAL_SURFACES_CLASS =
             "com.android.systemui.statusbar.phone.CentralSurfacesImpl";
+
+    // The anonymous observer + its lambda from the stack trace
+    private static final String OBSERVER_CLASS =
+            "com.android.systemui.statusbar.phone.CentralSurfacesImpl$11";
+    private static final String LAMBDA_CLASS =
+            "com.android.systemui.statusbar.phone.CentralSurfacesImpl$11$$ExternalSyntheticLambda0";
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
         if (!SYSTEMUI_PACKAGE.equals(lpparam.packageName)) return;
-
         XposedBridge.log(TAG + ": SystemUI loaded, installing fix...");
 
-        // 1. PRIMARY FIX: no-op the crashing lambda entirely.
-        //    The lambda only runs FPS-specific window layout logic, which is
-        //    meaningless on a device with no FPS sensor.
-        try {
-            Class<?> lambdaClass = XposedHelpers.findClass(
-                    CRASH_LAMBDA, lpparam.classLoader);
-
-            XposedBridge.hookAllMethods(lambdaClass, "run",
-                    XC_MethodReplacement.DO_NOTHING);
-
-            XposedBridge.log(TAG + ": Lambda neutralized -> " + CRASH_LAMBDA);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Could not hook lambda (will rely on field patch): " + t);
-        }
-
-        // 2. SECONDARY FIX: patch every FingerprintManager-typed field on
-        //    CentralSurfacesImpl with a proxy that returns false for
-        //    isPowerbuttonFps(), in case some other code path hits the NPE.
+        // 1. Patch fields on CentralSurfacesImpl (safe, harmless)
         try {
             Class<?> centralSurfaces = XposedHelpers.findClass(
                     CENTRAL_SURFACES_CLASS, lpparam.classLoader);
-
             XposedBridge.hookAllConstructors(centralSurfaces, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    patchAllFingerprintFields(param.thisObject, centralSurfaces,
-                            lpparam.classLoader, "constructor");
+                    patchFingerprintFields(param.thisObject, "CentralSurfacesImpl-ctor");
                 }
             });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": CentralSurfacesImpl hook failed: " + t);
+        }
 
-            XposedBridge.hookAllMethods(centralSurfaces, "onStartedWakingUp",
-                    new XC_MethodHook() {
+        // 2. Patch fields on the anonymous observer class (this is where
+        //    mFingerprintManager actually lives on some builds)
+        try {
+            Class<?> observer = XposedHelpers.findClass(
+                    OBSERVER_CLASS, lpparam.classLoader);
+            XposedBridge.hookAllConstructors(observer, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    patchFingerprintFields(param.thisObject, "Observer-ctor");
+                    // Also patch outer class reached via this$0
+                    patchOuterReference(param.thisObject, "Observer-ctor-outer");
+                }
+            });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": Observer hook skipped: " + t);
+        }
+
+        // 3. THE REAL FIX: hook the lambda's run() and patch its captured
+        //    fields BEFORE it executes, then let it run normally.
+        try {
+            Class<?> lambda = XposedHelpers.findClass(
+                    LAMBDA_CLASS, lpparam.classLoader);
+
+            XposedBridge.hookAllMethods(lambda, "run", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    patchAllFingerprintFields(param.thisObject, centralSurfaces,
-                            lpparam.classLoader, "onStartedWakingUp");
+                    Object lambdaInstance = param.thisObject;
+                    Class<?> c = lambdaInstance.getClass();
+
+                    // Walk the lambda's captured fields (arg$1, arg$2, ...)
+                    while (c != null && c != Object.class) {
+                        for (Field f : c.getDeclaredFields()) {
+                            try {
+                                f.setAccessible(true);
+                                Object captured = f.get(lambdaInstance);
+                                if (captured == null) continue;
+
+                                // Patch FingerprintManager fields on the captured object
+                                patchFingerprintFields(captured,
+                                        "lambda-capture:" + f.getName());
+
+                                // And one level deeper, to reach the outer
+                                // CentralSurfacesImpl$11 -> CentralSurfacesImpl
+                                patchOuterReference(captured,
+                                        "lambda-capture-outer:" + f.getName());
+                            } catch (Throwable ignored) {}
+                        }
+                        c = c.getSuperclass();
+                    }
                 }
             });
 
-            XposedBridge.log(TAG + ": Field-patch hooks installed.");
+            XposedBridge.log(TAG + ": Lambda hook installed (runs normally, fields pre-patched).");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Field-patch hooks failed: " + t);
+            XposedBridge.log(TAG + ": Lambda hook failed: " + t);
         }
 
         XposedBridge.log(TAG + ": Done.");
     }
 
-    private static void patchAllFingerprintFields(Object instance, Class<?> clazz,
-                                                  ClassLoader cl, String origin) {
-        Class<?> current = clazz;
-        while (current != null) {
-            for (Field f : current.getDeclaredFields()) {
+    /**
+     * Finds all FingerprintManager-typed fields on the given object (walking
+     * the class hierarchy) and replaces null ones with a safe proxy.
+     */
+    private static void patchFingerprintFields(Object instance, String origin) {
+        if (instance == null) return;
+        Class<?> c = instance.getClass();
+        while (c != null && c != Object.class) {
+            for (Field f : c.getDeclaredFields()) {
                 if (!FingerprintManager.class.isAssignableFrom(f.getType())) continue;
                 try {
                     f.setAccessible(true);
-                    Object val = f.get(instance);
-                    if (val == null) {
-                        f.set(instance, createDummyFingerprintManager(cl));
+                    if (f.get(instance) == null) {
+                        f.set(instance, createDummyFingerprintManager(
+                                instance.getClass().getClassLoader()));
                         XposedBridge.log(TAG + ": [" + origin + "] Patched "
-                                + current.getSimpleName() + "." + f.getName());
+                                + c.getSimpleName() + "." + f.getName());
                     }
-                } catch (Throwable t) {
-                    XposedBridge.log(TAG + ": [" + origin + "] Patch failed for "
-                            + f.getName() + ": " + t);
-                }
+                } catch (Throwable ignored) {}
             }
-            current = current.getSuperclass();
+            c = c.getSuperclass();
         }
+    }
+
+    /**
+     * If the object has a synthetic this$0 field, patch FingerprintManager
+     * fields on the outer object too. Covers CentralSurfacesImpl$11 -> CentralSurfacesImpl.
+     */
+    private static void patchOuterReference(Object instance, String origin) {
+        if (instance == null) return;
+        try {
+            Field outer = instance.getClass().getDeclaredField("this$0");
+            outer.setAccessible(true);
+            Object outerObj = outer.get(instance);
+            if (outerObj != null) {
+                patchFingerprintFields(outerObj, origin);
+            }
+        } catch (NoSuchFieldException ignored) {
+            // Not an anonymous inner class; nothing to do
+        } catch (Throwable ignored) {}
     }
 
     private static Object createDummyFingerprintManager(ClassLoader classLoader) {
