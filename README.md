@@ -30,4 +30,4 @@ mFingerprintManager.isPowerbuttonFps();
 ## 範圍
 
 - **套件：** `com.android.systemui`
-- **SystemUI 重新啟動：** 啟用後必須重新啟動
+- **SystemUI 重新啟動：** 在`LSPosed`中啟用後必須重新啟動SystemUI ,可使用 `pkill` 或 `am crash`
