@@ -30,6 +30,6 @@ mFingerprintManager.isPowerbuttonFps();
 ## 範圍
 
 - **套件：** `com.android.systemui`
-- **正式啟用：** 在`LSPosed`中啟用後必須重新啟動SystemUI ,可在`adb shell`中使用`pkill -f com.android.systemui` 快速重啟
+- **正式啟用：** 在`LSPosed`中啟用後**必須重新啟動**SystemUI ,可在`adb shell`中使用`pkill -f com.android.systemui` 快速重啟
 
 
