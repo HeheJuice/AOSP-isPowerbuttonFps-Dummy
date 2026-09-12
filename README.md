@@ -2,7 +2,7 @@
 
 - 修復 Android 14 + 裝置上 SystemUI 的崩潰問題：這些裝置**沒有指紋感應器**，但系統仍然要求 
 
-- 本模块是針對已 `Root` 並安装了 `AOSP 14 2023-10-05` 版本 `Framework`和`SystemUI`的 `Famue BF66 MP4` 設計 ,用於修復 `DozeAlwaysOn` 導致的崩潰 
+- 本模块是針對已 `Root` 並安装了的 `Famue BF66` 設計 ,用於修復 `DozeAlwaysOn` 導致的崩潰 
 
 - 其他 `Android 14 +` 設备有需要也可使用
 
